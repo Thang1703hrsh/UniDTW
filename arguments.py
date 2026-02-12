@@ -309,7 +309,44 @@ def add_contrakd_args(parser: argparse.ArgumentParser):
                       help="[DEPRECATED] For old 2-stage architecture")
     group.add_argument("--hybrid-l2-weight", type=float, default=0.4,
                       help="[DEPRECATED] For old 2-stage architecture")
-    
+
+    # DTW loss configuration
+    group.add_argument("--dtw-weight", type=float, default=1.0,
+                      help="Weight for DTW loss term")
+    group.add_argument("--dtw-window", type=int, default=32,
+                      help="Sakoe-Chiba window size for banded DTW")
+    group.add_argument("--dtw-gamma", type=float, default=0.1,
+                      help="Soft-DTW smoothing parameter")
+    group.add_argument("--dtw-distance", type=str, default="cosine", choices=["cosine", "l2"],
+                      help="Distance metric for DTW cost")
+    group.add_argument("--dtw-normalize", action="store_true",
+                      help="Normalize DTW loss by sequence length")
+    group.add_argument("--dtw-use-divergence", action="store_true",
+                      help="Use DTW divergence s2t - 0.5*(s2s + t2t)")
+    group.add_argument("--dtw-band-width", type=int, default=0,
+                      help="Adaptive band width for DTW band penalty")
+    group.add_argument("--dtw-band-penalty", type=float, default=1.0,
+                      help="Penalty added outside the adaptive DTW band")
+    group.add_argument("--dtw-band-center-blend", type=float, default=0.7,
+                      help="Blend between linear and soft alignment centers")
+    group.add_argument("--dtw-band-entropy-coef", type=float, default=2.0,
+                      help="Entropy coefficient for adaptive band width")
+    group.add_argument("--dtw-band-warmup-steps", type=int, default=0,
+                      help="Warmup steps for band penalty strength")
+    group.add_argument("--dtw-band-source", type=str, default="none", choices=["none", "sdtw"],
+                      help="Source for DTW banding (sdtw or none)")
+    group.add_argument("--dtw-gamma-start", type=float, default=None,
+                      help="Start value for DTW gamma schedule")
+    group.add_argument("--dtw-gamma-end", type=float, default=None,
+                      help="End value for DTW gamma schedule")
+    group.add_argument("--dtw-gamma-steps", type=int, default=0,
+                      help="Steps for DTW gamma schedule")
+    group.add_argument("--dtw-unitization", action="store_true",
+                      help="Pool tokens into units for DTW cost")
+    group.add_argument("--dtw-importance-weights", type=str, default="none",
+                      choices=["none", "teacher_entropy"],
+                      help="Importance weighting source for DTW costs")
+
     return parser
 
 def add_csd_args(parser: argparse.ArgumentParser):

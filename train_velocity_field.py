@@ -40,9 +40,7 @@ from utils import get_tokenizer, get_model, get_distillation_schedule
 # from distillm import skewed_forward_kl, skewed_reverse_kl
 # from distillm import SampleGenerator, ReplayBuffer
 
-from distillm.velocity_field import VelocityField
 from distillm.projector import Projector
-from distillm.losses import velocity_field_loss
 
 from rouge_metric import compute_metrics
 
@@ -275,16 +273,41 @@ def prepare_dataset(args, tokenizer):
     return data
 
 
+def projector_loss(
+    student_hiddens,
+    teacher_hiddens,
+    projector,
+    teacher_schedule,
+    student_schedule,
+    attention_mask,
+    device=0,
+):
+    total_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
+    num_layers = len(teacher_schedule)
+    mask = attention_mask.to(device=f"cuda:{device}", dtype=torch.float32)
+
+    for teacher_layer_idx, student_layer_idx in zip(teacher_schedule, student_schedule):
+        y_S = student_hiddens[student_layer_idx].to(device=f"cuda:{device}", dtype=torch.float32)
+        y_T = teacher_hiddens[teacher_layer_idx].to(device=f"cuda:{device}", dtype=torch.float32)
+        y_S = projector(y_S)
+
+        loss_per_token = F.mse_loss(y_S, y_T, reduction="none").mean(dim=-1)
+        loss_per_token *= mask
+        loss = loss_per_token.sum() / mask.sum()
+        total_loss += loss / num_layers
+
+    return total_loss
+
+
 def train(
-    args, 
-    tokenizer: AutoTokenizer, 
-    model: deepspeed.DeepSpeedEngine, 
-    optimizer: AdamW, 
-    lr_scheduler, 
-    dataset, 
-    device, 
+    args,
+    tokenizer: AutoTokenizer,
+    model: deepspeed.DeepSpeedEngine,
+    optimizer: AdamW,
+    lr_scheduler,
+    dataset,
+    device,
     teacher_model=None,
-    velocity_field: VelocityField | None = None,
     projector: Projector | None = None
 ):
     print_rank("Start Fine-tuning")
@@ -334,16 +357,14 @@ def train(
                     raise NotImplementedError
                 dataset["train"].move_to_device(model_batch, no_model_batch, gen_data, f"cuda:{args.student_device}")
                 outputs = model(**model_batch, use_cache=False, output_hidden_states=True)
-            # velocity field loss computation here
-            loss = velocity_field_loss(
+            loss = projector_loss(
                 outputs.hidden_states,
                 teacher_outputs.hidden_states,
-                velocity_field,
                 projector,
                 teacher_schedule,
                 student_schedule,
                 model_batch["attention_mask"],
-                args.student_device
+                args.student_device,
             ) / args.gradient_accumulation_steps
 
             loss.backward()
@@ -397,9 +418,9 @@ def train(
                 # Log to wandb (only rank 0)
                 if dist.get_rank() == 0:
                     log_metrics({
-                        "velocity_field/loss": total_loss,
-                        "velocity_field/lr": lr_scheduler.get_last_lr()[0],
-                        "velocity_field/epoch": epoch,
+                        "projector/loss": total_loss,
+                        "projector/lr": lr_scheduler.get_last_lr()[0],
+                        "projector/epoch": epoch,
                     }, step=global_step)
                 
                 total_loss, total_distil_loss, total_time = 0.0, 0.0, 0.0
@@ -413,7 +434,7 @@ def train(
                 break
             
     optimizer.zero_grad()
-    return velocity_field, projector
+    return projector
 
 
 def main():
@@ -433,16 +454,14 @@ def main():
     
     # Initialize wandb (only on rank 0) - reads from wandb_config.yaml if key not provided
     if dist.get_rank() == 0:
-        wandb_name = args.wandb_name or f"velocity-field-{args.ckpt_name}"
+        wandb_name = args.wandb_name or f"projector-{args.ckpt_name}"
         wandb_config = {
-            "type": "velocity_field",
+            "type": "projector",
             "student": args.ckpt_name,
             "teacher": args.teacher_model_path,
             "epochs": args.epochs,
             "batch_size": args.batch_size,
             "lr": args.lr,
-            "velocity_n_layers": args.velocity_n_layers,
-            "velocity_d_model": args.velocity_d_model,
         }
         # Pass wandb_key (can be None, will auto-load from YAML)
         init_wandb(args.wandb_project, wandb_name, wandb_config, args.wandb_key, args.base_path)
@@ -500,28 +519,20 @@ def main():
     else:
         teacher_model = None
     
-    # setup velocity field and projector
-    velocity_field = VelocityField(
-        d_input=args.d_teacher,
-        d_model=args.velocity_d_model,
-        num_distill_layers=args.num_distill_layers,
-        n_layers=args.velocity_n_layers
-    ).to(f"cuda:{args.student_device}")
+    # setup projector (no velocity field training)
     projector = Projector(
         d_student=args.d_student,
         d_teacher=args.d_teacher
     ).to(f"cuda:{args.student_device}")
-    velocity_field.train()
     projector.train()
-    
-    optimizer = get_optimizer(args, velocity_field)
+
+    optimizer = get_optimizer(args, projector)
     assert type(optimizer) is torch.optim.AdamW
-    optimizer.add_param_group({'params': projector.parameters()})
     lr_scheduler = get_learning_rate_scheduler(args, optimizer)
-    
+
     if args.do_train:
-        velocity_field, projector = train(args, tokenizer, model, optimizer, lr_scheduler, dataset, device, teacher_model, velocity_field, projector)
-    
+        projector = train(args, tokenizer, model, optimizer, lr_scheduler, dataset, device, teacher_model, projector)
+
     if args.save:
         save_dir_path = os.path.join(args.save)
         if args.model_parallel:
@@ -530,7 +541,6 @@ def main():
             if dist.get_rank() == 0:
                 os.makedirs(save_dir_path, exist_ok=True)
                 print_rank(f"Model save to {save_dir_path}")
-                torch.save(velocity_field.state_dict(), os.path.join(save_dir_path, "velocity_field.pth"))
                 torch.save(projector.state_dict(), os.path.join(save_dir_path, "projector.pth"))
         dist.barrier()
     

@@ -32,22 +32,21 @@ TEACHER_NAME="gpt2-1.5B-dolly"
 TEACHER_MODEL_PATH="bachthetrollface/gpt2-1.5B-teacher-dolly"
 
 # --- DATA ---
-# Đường dẫn đến dữ liệu DistiLLM-2 đã format (quan trọng: phải là folder chứa arrow files)
-DATA_DIR="${BASE_PATH}/data/distillm2/gpt2/formatted/"
+DATA_DIR="${BASE_PATH}/processed_data/dolly/full/gpt2/"
 
 # =========================================================
 # 3. HYPERPARAMETERS
 # =========================================================
-BATCH_SIZE=8        # Giảm xuống 8 vì đang chạy 2 GPU (Tổng batch = 16)
+BATCH_SIZE=16        # Giảm xuống 8 vì đang chạy 2 GPU (Tổng batch = 16)
 LR=0.0005
-GRAD_ACC=1
+GRAD_ACC=2
 EVAL_BATCH_SIZE=32
 
 # Length
 MAX_LENGTH=512
 
 # Output Path
-SAVE_PATH="${BASE_PATH}/results/gpt2/train/velocity_field/distillm2"
+SAVE_PATH="${BASE_PATH}/results/gpt2/train/velocity_field"
 SEED=10
 
 # =========================================================
@@ -97,8 +96,7 @@ OPTS+=" --seed ${SEED}"
 OPTS+=" --deepspeed"
 OPTS+=" --deepspeed_config ${BASE_PATH}/configs/deepspeed/ds_config.json"
 
-# Type (Dùng lm-distillm2 để train velocity field trên dữ liệu student sinh ra)
-OPTS+=" --type lm-distillm2"
+OPTS+=" --type lm"
 
 # Gen Config
 OPTS+=" --do-sample"
@@ -108,8 +106,7 @@ OPTS+=" --temperature 1.0"
 
 # --- CONTRA-KD ARCHITECTURE CONFIG ---
 # Cấu hình chính xác cho cặp GPT-2 120M vs GPT-2 1.5B
-OPTS+=" --velocity-n-layers 4"
-OPTS+=" --velocity-d-model 1024"
+
 OPTS+=" --d-teacher 1600"        # GPT-2 XL (1.5B) hidden size
 OPTS+=" --d-student 768"         # GPT-2 Base (120M) hidden size
 OPTS+=" --num-distill-layers 6"

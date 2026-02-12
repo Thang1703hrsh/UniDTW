@@ -42,7 +42,7 @@ from distillm import skewed_forward_kl, skewed_reverse_kl
 from distillm import SampleGenerator, ReplayBuffer
 from distillm.velocity_field import VelocityField
 from distillm.projector import Projector
-from distillm.losses import frfd_distillation_loss, get_fdd_loss, get_csd_loss
+from distillm.losses import frfd_distillation_loss, get_fdd_loss, get_csd_loss, dtw_distillation_loss
 
 from distillm2.losses import get_distillm2_loss_split
 
@@ -481,7 +481,7 @@ def finetune(
     student_generator = SampleGenerator(args, tokenizer)
 
     step, global_step = 1, 1
-    total_loss, total_distil_loss, total_contra_loss, total_fdd_loss, total_time = 0.0, 0.0, 0.0, 0.0, 0.0
+    total_loss, total_distil_loss, total_contra_loss, total_dtw_loss, total_fdd_loss, total_time = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
     
     adaptive_threshold = args.init_threshold if "adaptive" in args.type else None
     if args.do_valid:
@@ -495,7 +495,7 @@ def finetune(
     torch.cuda.empty_cache()
     
     output_hidden_states = False
-    if "contra" in args.type or "fdd" in args.type:
+    if "contra" in args.type or "fdd" in args.type or "dtw" in args.type:
         teacher_schedule, student_schedule = get_distillation_schedule(
             args.num_teacher_layers,
             args.num_student_layers,
@@ -642,8 +642,8 @@ def finetune(
                 #     mask = mask[:new_batch_size]
                 #     hidden_states = tuple([hs[:new_batch_size] for hs in hidden_states])
                 contra_loss = frfd_distillation_loss(
-                    hidden_states, 
-                    velocity_field, projector, 
+                    hidden_states,
+                    velocity_field, projector,
                     student_schedule, mask,
                     args.num_distill_layers,
                     cur_t=cur_t,
@@ -652,6 +652,54 @@ def finetune(
                 loss += args.kd_ratio * contra_loss
             else:
                 contra_loss = torch.tensor(0.0).to(loss.device)
+
+            if "dtw" in args.type:
+                hidden_states = outputs.hidden_states
+                mask = (no_model_batch["label"] != -100).float()
+
+                if args.dtw_gamma_steps and args.dtw_gamma_steps > 0:
+                    gamma_start = args.dtw_gamma_start if args.dtw_gamma_start is not None else args.dtw_gamma
+                    gamma_end = args.dtw_gamma_end if args.dtw_gamma_end is not None else args.dtw_gamma
+                    progress = min(1.0, float(global_step) / float(args.dtw_gamma_steps))
+                    dtw_gamma = gamma_start + (gamma_end - gamma_start) * progress
+                else:
+                    dtw_gamma = args.dtw_gamma
+
+                unit_ids = None
+                importance_weights = None
+                if args.dtw_unitization:
+                    unit_ids = no_model_batch.get("unit_ids", None)
+                if args.dtw_importance_weights == "teacher_entropy":
+                    with torch.no_grad():
+                        teacher_probs = torch.softmax(teacher_logits.float(), dim=-1)
+                        entropy = -(teacher_probs * torch.log(teacher_probs + 1e-9)).sum(dim=-1)
+                    importance_weights = 1.0 / (entropy + 1e-6)
+
+                dtw_loss = dtw_distillation_loss(
+                    hidden_states,
+                    teacher_outputs.hidden_states,
+                    student_schedule,
+                    teacher_schedule,
+                    mask,
+                    projector=projector,
+                    window_size=args.dtw_window,
+                    gamma=dtw_gamma,
+                    distance=args.dtw_distance,
+                    normalize=args.dtw_normalize,
+                    use_divergence=args.dtw_use_divergence,
+                    band_source=args.dtw_band_source,
+                    band_width=args.dtw_band_width,
+                    band_penalty=args.dtw_band_penalty,
+                    band_center_blend=args.dtw_band_center_blend,
+                    band_entropy_coef=args.dtw_band_entropy_coef,
+                    band_warmup_steps=args.dtw_band_warmup_steps,
+                    current_step=global_step,
+                    unit_ids=unit_ids,
+                    importance_weights=importance_weights,
+                )
+                loss += args.dtw_weight * dtw_loss
+            else:
+                dtw_loss = torch.tensor(0.0).to(loss.device)
                 
             if args.lm_data_dir is not None:
                 assert args.lm_coef is not None
@@ -674,7 +722,13 @@ def finetune(
                 dist.all_reduce(contra_loss, dist.ReduceOp.SUM, group=dp_group)
                 global_contra_loss = contra_loss.item() / dp_world_size
                 total_contra_loss += global_contra_loss / (args.log_interval * args.gradient_accumulation_steps)
-            
+
+            global_dtw_loss = 0
+            if "dtw" in args.type:
+                dist.all_reduce(dtw_loss, dist.ReduceOp.SUM, group=dp_group)
+                global_dtw_loss = dtw_loss.item() / dp_world_size
+                total_dtw_loss += global_dtw_loss / (args.log_interval * args.gradient_accumulation_steps)
+
             global_fdd_loss = 0
             if "fdd" in args.type:
                 dist.all_reduce(fdd_loss, dist.ReduceOp.SUM, group=dp_group)
@@ -688,8 +742,8 @@ def finetune(
             total_time += elapsed_time
 
             # Logging
-            def get_log(log_loss, log_distil_loss, log_contra_loss, log_fdd_loss, log_time):
-                return "train | epoch {:3d} | Iter: {:6d}/{:6d} | global iter: {:6d}/{:6d} | loss: {:.4f} | ds_loss: {:.4f} | contra_loss: {:.4f} | fdd_loss: {:.4f} | lr: {:.4e} | scale: {:10.4f} | micro time: {:.3f} | step time: {:.3f}".format(
+            def get_log(log_loss, log_distil_loss, log_contra_loss, log_dtw_loss, log_fdd_loss, log_time):
+                return "train | epoch {:3d} | Iter: {:6d}/{:6d} | global iter: {:6d}/{:6d} | loss: {:.4f} | ds_loss: {:.4f} | contra_loss: {:.4f} | dtw_loss: {:.4f} | fdd_loss: {:.4f} | lr: {:.4e} | scale: {:10.4f} | micro time: {:.3f} | step time: {:.3f}".format(
                     epoch,
                     step,
                     args.total_iters * args.gradient_accumulation_steps,
@@ -698,6 +752,7 @@ def finetune(
                     log_loss,
                     log_distil_loss,
                     log_contra_loss,
+                    log_dtw_loss,
                     log_fdd_loss,
                     lr_scheduler.get_last_lr()[0],
                     optimizer.cur_scale if hasattr(optimizer, "cur_scale") else 0,
@@ -709,13 +764,14 @@ def finetune(
                 mid_log_step = args.gradient_accumulation_steps // args.mid_log_num
                 mid_log_step = 1 if mid_log_step == 0 else mid_log_step
                 if step % mid_log_step == 0:
-                    print_rank(get_log(global_loss, global_distil_loss, global_contra_loss, global_fdd_loss, 0))
+                    print_rank(get_log(global_loss, global_distil_loss, global_contra_loss, global_dtw_loss, global_fdd_loss, 0))
 
             if global_step % args.log_interval == 0 and step % args.gradient_accumulation_steps == 0:
                 log_str = get_log(
                     total_loss,
                     total_distil_loss,
                     total_contra_loss,
+                    total_dtw_loss,
                     total_fdd_loss,
                     total_time / (args.log_interval))
                 # print_rank("*" * 100)
@@ -734,11 +790,13 @@ def finetune(
                     }
                     if "contra" in args.type:
                         metrics["train/contra_loss"] = total_contra_loss
+                    if "dtw" in args.type:
+                        metrics["train/dtw_loss"] = total_dtw_loss
                     if "fdd" in args.type:
                         metrics["train/fdd_loss"] = total_fdd_loss
                     log_metrics(metrics, step=global_step)
-                
-                total_loss, total_distil_loss, total_contra_loss, total_fdd_loss, total_time = 0.0, 0.0, 0.0, 0.0, 0.0
+
+                total_loss, total_distil_loss, total_contra_loss, total_dtw_loss, total_fdd_loss, total_time = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
 
             # Evaluation
@@ -1035,7 +1093,17 @@ def main():
     else:
         velocity_field = None
         projector = None
-    
+
+    if projector is None and args.projector_path is not None:
+        projector = Projector(d_student=args.d_student, d_teacher=args.d_teacher)
+        projector.load_state_dict(torch.load(
+            args.projector_path,
+            map_location=f"cuda:{device}",
+            weights_only=True
+        ))
+        projector.to(device)
+        projector.eval()
+
     if teacher_model:
         teacher_model.resize_token_embeddings(len(tokenizer))
     

@@ -7,7 +7,7 @@ MASTER_ADDR=localhost
 MASTER_PORT=2012
 NNODES=1
 NODE_RANK=0
-GPUS_PER_NODE=2  # Set mặc định là 2 (cho 2 GPU A100 của bạn)
+GPUS_PER_NODE=1  # Set mặc định là 2 (cho 2 GPU A100 của bạn)
 
 DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE \
                   --nnodes $NNODES \
