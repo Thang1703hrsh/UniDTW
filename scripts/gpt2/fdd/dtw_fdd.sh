@@ -39,12 +39,12 @@ LM_DATA_DIR="${BASE_PATH}/processed_data/openwebtext/gpt2/512/22.87K/"
 # =========================================================
 # 3. HYPERPARAMETERS
 # =========================================================
-BATCH_SIZE=8       # An toàn cho 2 GPU
+BATCH_SIZE=8       # Tăng lên để stable hơn (effective batch = 8*2*2 = 32)
 LR=0.0005
-GRAD_ACC=2         # Tăng tích lũy gradient để bù cho batch size nhỏ
+GRAD_ACC=1       # Tăng tích lũy gradient để bù cho batch size nhỏ
 EVAL_BATCH_SIZE=64
 MAX_LENGTH=512
-SAVE_PATH="${BASE_PATH}/results/gpt2/train/dtw/fdd/base"
+SAVE_PATH="${BASE_PATH}/results/gpt2/train/dtw/fdd/dtw"
 SEED=10
 
 OPTS=""
@@ -56,10 +56,15 @@ OPTS+=" --ckpt-name ${CKPT_NAME}"
 OPTS+=" --teacher-ckpt-name ${TEACHER_CKPT_NAME}"
 OPTS+=" --teacher-model-fp16"
 OPTS+=" --n-gpu ${GPUS_PER_NODE}"
-OPTS+=" --gradient-checkpointing"
+
+# OPTS+=" --gradient-checkpointing"
 # data
+
 OPTS+=" --data-dir ${DATA_DIR}"
-OPTS+=" --lm-data-dir ${LM_DATA_DIR}"
+if [ -n "$LM_DATA_DIR" ]; then
+    OPTS+=" --lm-data-dir ${LM_DATA_DIR}"
+fi
+
 OPTS+=" --num-workers 4"
 OPTS+=" --dev-num 1000"
 
@@ -70,7 +75,7 @@ OPTS+=" --dtw-gamma 0.1"
 OPTS+=" --dtw-distance cosine"
 OPTS+=" --dtw-normalize"
 
-OPTS+=" --dtw-unitization"
+OPTS+=" --dtw-unitization"  # Disable for FDD to avoid token mismatch
 # OPTS+=" --dtw-importance-weights teacher_entropy"
 
 OPTS+=" --num-distill-layers 6"
@@ -82,7 +87,7 @@ OPTS+=" --lr ${LR}"
 OPTS+=" --batch-size ${BATCH_SIZE}"
 OPTS+=" --eval-batch-size ${EVAL_BATCH_SIZE}"
 OPTS+=" --gradient-accumulation-steps ${GRAD_ACC}"
-OPTS+=" --warmup-iters 0"
+OPTS+=" --warmup-iters 100"  # Add warmup for FDD stability
 OPTS+=" --lr-decay-style cosine"
 OPTS+=" --weight-decay 1e-2"
 OPTS+=" --clip-grad 1.0"
@@ -113,11 +118,22 @@ OPTS+=" --top-k 0"
 OPTS+=" --top-p 1.0"
 OPTS+=" --temperature 1.0"
 
-
 OPTS+=" --d-teacher 1600"
 OPTS+=" --d-student 768"
 
 OPTS+=" --projector-path ${PROJECTOR_CKPT}"
+
+# distillm
+OPTS+=" --student-gen"
+
+OPTS+=" --teacher_layer_mapping 16 24 32"
+OPTS+=" --student_layer_mapping 4 6 8"
+
+OPTS+=" --gen-num-beams 1"
+OPTS+=" --gen-top-p 1.0"
+OPTS+=" --init-threshold 0.0"
+OPTS+=" --loss-eps 0.1"
+OPTS+=" --capacity 1000"
 
 export NCCL_DEBUG=""
 export TF_CPP_MIN_LOG_LEVEL=3

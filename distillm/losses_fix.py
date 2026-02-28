@@ -241,11 +241,9 @@ def _apply_importance_weights(cost: torch.Tensor, weights: torch.Tensor | None) 
 
 
 def _soft_dtw_banded(cost: torch.Tensor, gamma: float, window_size: int | None) -> torch.Tensor:
-    # Always compute in float32 to avoid fp16 overflow/NaN
-    cost = cost.float()
     n, m = cost.shape
-    large = 1e9
-    dp = torch.full((n + 1, m + 1), large, device=cost.device, dtype=torch.float32)
+    inf = torch.tensor(float("inf"), device=cost.device, dtype=cost.dtype)
+    dp = torch.full((n + 1, m + 1), inf, device=cost.device, dtype=cost.dtype)
     dp[0, 0] = 0.0
 
     for i in range(1, n + 1):
@@ -258,8 +256,7 @@ def _soft_dtw_banded(cost: torch.Tensor, gamma: float, window_size: int | None) 
             r0 = dp[i - 1, j - 1]
             r1 = dp[i - 1, j]
             r2 = dp[i, j - 1]
-            # Clamp to avoid -inf/nan in logsumexp
-            stacked = torch.stack((-r0 / gamma, -r1 / gamma, -r2 / gamma)).clamp(min=-1e6)
+            stacked = torch.stack((-r0 / gamma, -r1 / gamma, -r2 / gamma))
             softmin = -gamma * torch.logsumexp(stacked, dim=0)
             dp[i, j] = cost[i - 1, j - 1] + softmin
     return dp[n, m]
@@ -365,10 +362,6 @@ def dtw_distillation_loss(
         student_layer = projector(student_layer)
     elif student_layer.size(-1) != teacher_layer.size(-1):
         raise ValueError("DTW requires a projector when student/teacher dimensions differ.")
-
-    # Always use float32 for numerical stability
-    student_layer = student_layer.float()
-    teacher_layer = teacher_layer.float()
 
     use_cuda_sdtw = _HAS_SOFT_DTW and torch.cuda.is_available() and attention_mask.is_cuda
 
@@ -533,10 +526,7 @@ def dtw_distillation_loss(
 
     if count == 0:
         return torch.tensor(0.0, device=attention_mask.device, dtype=torch.float32)
-    result = total_loss / count
-    if torch.isnan(result) or torch.isinf(result):
-        return torch.tensor(0.0, device=attention_mask.device, dtype=torch.float32)
-    return result
+    return total_loss / count
 
 
 def velocity_field_loss(
@@ -662,23 +652,25 @@ def get_fdd_loss(t_hiddens, s_hiddens, mask, teacher, student, teacher_schedule,
         # traj_loss += forward_kl(s_hidden_logits, t_hidden_logits, no_model_batch)
         traj_loss += soft_label_distill_loss(s_hidden_logits, t_hidden_logits, mask)
 
-        # FIX #5: Cast to float32 to prevent fp16 overflow in log_softmax
         s_hidden_logs = F.log_softmax(s_hidden_logits, dim=-1, dtype=torch.float32)
         t_hidden_logs = F.log_softmax(t_hidden_logits, dim=-1, dtype=torch.float32)
 
         if i > 0:
-            # FIX #2: Detach previous logs to stop gradient flow through all layers
-            # This prevents exponential gradient accumulation across layers
+            # CRITICAL: Detach previous logs to stop gradient flow and prevent instability
             delta_hidden_student = s_hidden_logs - pre_s_hidden_logs.detach()
             delta_hidden_teacher = t_hidden_logs - pre_t_hidden_logs.detach()
 
+            # Compute cosine similarity in the original space (without normalization)
+            # to preserve the semantic meaning of the trajectory
             cos_sim = F.cosine_similarity(delta_hidden_student, delta_hidden_teacher, dim=-1, eps=1e-6)
-            # Clamp cosine similarity to valid range to prevent numerical errors
+            # Clamp cosine similarity to valid range [-1, 1]
             cos_sim = torch.clamp(cos_sim, -1.0, 1.0)
             cos_sim_loss = 1 - cos_sim
+
+            # Apply mask and compute mean
             cos_sim_loss = (cos_sim_loss * mask).sum() / (mask.sum() + 1e-8)
 
-            # FIX #4: Clamp derivative loss to prevent unbounded growth
+            # Clamp the derivative loss to prevent explosion
             cos_sim_loss = torch.clamp(cos_sim_loss, 0.0, 10.0)
 
             der_loss += cos_sim_loss
@@ -687,12 +679,12 @@ def get_fdd_loss(t_hiddens, s_hiddens, mask, teacher, student, teacher_schedule,
 
         i += 1
 
-    # FIX #3: Safe division to avoid division by zero
+    # Safe division: avoid division by zero
     if i == 0:
         return torch.tensor(0.0, device=mask.device, dtype=torch.float32)
 
     avg_traj_loss = traj_loss / i
-    avg_der_loss = der_loss / max(i - 1, 1)  # Avoid division by zero when i=1
+    avg_der_loss = der_loss / max(i - 1, 1)  # Avoid division by zero
 
     return avg_traj_loss + avg_der_loss
 

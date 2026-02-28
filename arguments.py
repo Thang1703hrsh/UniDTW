@@ -138,6 +138,8 @@ def add_hp_args(parser: argparse.ArgumentParser):
                        help='loss scale')
     group.add_argument("--kd-ratio", type=float, default=None)
 
+    group.add_argument('--warmup-ratio', type=float, default=0.0),
+
     group.add_argument('--warmup-iters', type=int, default=0,
                        help='percentage of data to warmup on (.01 = 1% of all '
                        'training iters). Default 0.01')
@@ -198,6 +200,11 @@ def add_distillm_args(parser: argparse.ArgumentParser):
     group.add_argument("--capacity", type=int, default=1000)
     group.add_argument("--replay-ratio", type=str, default="decreasing")
     # group.add_argument("--time", action="store_true")
+
+    group.add_argument("--student_layer_mapping", nargs='+', type=int, default=[-1])
+    group.add_argument("--teacher_layer_mapping", nargs='+', type=int, default=[-1])
+    group.add_argument("--split_layer_mapping", nargs='+', type=int, default=[0, 0, 0, 0])
+    
     return parser
 
 

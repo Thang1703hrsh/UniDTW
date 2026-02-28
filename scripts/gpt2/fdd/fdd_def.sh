@@ -29,18 +29,20 @@ TEACHER_CKPT="bachthetrollface/gpt2-1.5B-teacher-dolly"
 
 # data
 DATA_DIR="${BASE_PATH}/processed_data/dolly/full/gpt2/"
-# LM_DATA_DIR="${BASE_PATH}/processed_data/openwebtext/gpt2/512/22.87K/"
+LM_DATA_DIR="${BASE_PATH}/processed_data/openwebtext/gpt2/512/22.87K/"
+
 # hp
-BATCH_SIZE=8  # INCREASED: Larger batch size for more stable training (effective = 8*2*2 = 32)
+BATCH_SIZE=16
 LR=0.0001
 GRAD_ACC=1
 EVAL_BATCH_SIZE=64
+EPOCHS=5
 # length
-MAX_LENGTH=512
+MAX_LENGTH=256
 # runtime
-SAVE_PATH="${BASE_PATH}/results/gpt2/train/fdd/base"
+SAVE_PATH="${BASE_PATH}/results/gpt2/train/fdd_0.1B_1.5B"
 # seed
-SEED=10
+SEED=42
 
 
 OPTS=""
@@ -52,34 +54,33 @@ OPTS+=" --ckpt-name ${CKPT_NAME}"
 OPTS+=" --teacher-ckpt-name ${TEACHER_CKPT_NAME}"
 OPTS+=" --teacher-model-fp16"
 OPTS+=" --n-gpu ${GPUS_PER_NODE}"
-# OPTS+=" --gradient-checkpointing" 
+OPTS+=" --fp32"  # FIX: Add fp32 flag (or use --bf16 for bfloat16)
 # data
 OPTS+=" --data-dir ${DATA_DIR}"
-# OPTS+=" --lm-data-dir ${LM_DATA_DIR}"
-# OPTS+=" --lm-coef 0.5" 
-OPTS+=" --num-workers 4"
+OPTS+=" --num-workers 1"
 OPTS+=" --dev-num 1000"
 # hp
 OPTS+=" --lr ${LR}"
 OPTS+=" --batch-size ${BATCH_SIZE}"
 OPTS+=" --eval-batch-size ${EVAL_BATCH_SIZE}"
 OPTS+=" --gradient-accumulation-steps ${GRAD_ACC}"
-OPTS+=" --warmup-iters 0" 
+OPTS+=" --warmup-iters 0"
 OPTS+=" --lr-decay-style cosine"
 OPTS+=" --weight-decay 1e-2"
 OPTS+=" --clip-grad 1.0"
-OPTS+=" --epochs 20"
+OPTS+=" --epochs ${EPOCHS}"
 OPTS+=" --kd-ratio 1.0"
+OPTS+=" --warmup-ratio 0.1"
 # length
 OPTS+=" --max-length ${MAX_LENGTH}"
-OPTS+=" --max-prompt-length 256"
+OPTS+=" --max-prompt-length 128"
 # runtime
 OPTS+=" --do-train"
 OPTS+=" --do-valid"
 OPTS+=" --eval-gen"
 OPTS+=" --save-interval -1"
 OPTS+=" --eval-interval -1"
-OPTS+=" --log-interval 10"
+OPTS+=" --log-interval 4"
 OPTS+=" --mid-log-num -1"
 OPTS+=" --save ${SAVE_PATH}"
 # seed
@@ -88,18 +89,12 @@ OPTS+=" --seed ${SEED}"
 OPTS+=" --deepspeed"
 OPTS+=" --deepspeed_config ${BASE_PATH}/configs/deepspeed/ds_config.json"
 # type
-OPTS+=" --type rkl-fdd"
+OPTS+=" --type adaptive-srkl"
 # gen
 OPTS+=" --do-sample"
 OPTS+=" --top-k 0"
 OPTS+=" --top-p 1.0"
 OPTS+=" --temperature 1.0"
-
-#fdd config
-# OPTS+=" --num-distill-layers 6"
-# OPTS+=" --num-teacher-layers 48"
-# OPTS+=" --num-student-layers 12"
-
 # distillm
 OPTS+=" --student-gen"
 
@@ -115,11 +110,10 @@ OPTS+=" --capacity 1000"
 export NCCL_DEBUG=""
 export TF_CPP_MIN_LOG_LEVEL=3
 export PYTHONPATH=${BASE_PATH}
-CMD="torchrun ${DISTRIBUTED_ARGS} ${BASE_PATH}/finetune.py ${OPTS} $@"
-
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+CMD="torchrun ${DISTRIBUTED_ARGS} ${BASE_PATH}/fdd_finetune.py ${OPTS} $@"
 
 echo ${CMD}
 echo "PYTHONPATH=${PYTHONPATH}"
 mkdir -p ${SAVE_PATH}
 ${CMD}
+

@@ -230,3 +230,4 @@ __pycache__/
 # Dữ liệu (vì 654M và 52M là khá nặng để đẩy lên Git thông thường)
 data/
 processed_data/
+results/

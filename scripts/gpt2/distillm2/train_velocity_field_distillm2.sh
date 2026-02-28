@@ -1,10 +1,9 @@
-#! /bin/bash
-
 MASTER_ADDR=localhost
-MASTER_PORT=${2-2012}
+MASTER_PORT=2012
 NNODES=1
 NODE_RANK=0
-GPUS_PER_NODE=${3-16}
+# [FIX] Mặc định là 2 GPU cho server A100 của bạn
+GPUS_PER_NODE=2 
 
 DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE \
                   --nnodes $NNODES \
@@ -13,13 +12,18 @@ DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE \
                   --master_port $MASTER_PORT"
 
 # model
-BASE_PATH=${1-"/home/MiniLLM"}
+BASE_PATH=${1:-$(pwd)}
 CKPT_NAME="gpt2-base"
+
 # CKPT="${BASE_PATH}/checkpoints/${CKPT_NAME}/" # for testing, using base model
-CKPT="${BASE_PATH}/results/gpt2/train/init/${CKPT_NAME}"
-TEACHER="gpt2-xlarge"
+# CKPT="${BASE_PATH}/results/gpt2/train/init/${CKPT_NAME}"
+# TEACHER="gpt2-xlarge"
 # TEACHER_MODEL_PATH="${BASE_PATH}/checkpoints/${TEACHER}/"
-TEACHER_MODEL_PATH="${BASE_PATH}/results/gpt2/train/sft/${TEACHER}"
+# TEACHER_MODEL_PATH="${BASE_PATH}/results/gpt2/train/sft/${TEACHER}"
+
+TEACHER_MODEL_PATH="bachthetrollface/gpt2-1.5B-teacher-dolly"
+CKPT="bachthetrollface/gpt2-120M-init-dolly"
+
 # CKPT="gpt2" # download automatically
 # TEACHER_MODEL_PATH="MiniLLM/teacher-gpt2-1.5B"
 # data

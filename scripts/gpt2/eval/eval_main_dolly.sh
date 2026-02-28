@@ -4,7 +4,7 @@ MASTER_ADDR=localhost
 MASTER_PORT=${2-2113}
 NNODES=1
 NODE_RANK=0
-GPUS_PER_NODE=${3-1}
+GPUS_PER_NODE=2
 
 DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE \
                   --nnodes $NNODES \
@@ -13,9 +13,10 @@ DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE \
                   --master_port $MASTER_PORT"
 
 # model
-BASE_PATH=${1-"/home/MiniLLM"}
+BASE_PATH=${1:-$(pwd)}
 CKPT_NAME=${4-"gpt2-base"}
-CKPT="${BASE_PATH}/results/gpt2/train/${CKPT_NAME}/"
+CKPT="${BASE_PATH}/results/gpt2fix/train/dtw/distillm/0.1B_1.5B/"
+
 # data
 DATA_NAMES="dolly"
 DATA_DIR="${BASE_PATH}/data/dolly"

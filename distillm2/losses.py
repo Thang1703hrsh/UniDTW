@@ -188,10 +188,11 @@ def compute_position_kl(
         ).sum(-1)
     
     # Aggregate over sequence dimension
-    tea_position_kl = (tea_pos_kl * loss_mask).sum(-1) / loss_mask.sum(-1)
-    ref_position_kl = (ref_pos_kl * loss_mask).sum(-1) / loss_mask.sum(-1)
-    student_all_logps = (student_per_token_logps * loss_mask).sum(-1) / loss_mask.sum(-1)
-    teacher_all_logps = (teacher_per_token_logps * loss_mask).sum(-1) / loss_mask.sum(-1)
+    denom = loss_mask.sum(-1).clamp(min=1)
+    tea_position_kl = (tea_pos_kl * loss_mask).sum(-1) / denom
+    ref_position_kl = (ref_pos_kl * loss_mask).sum(-1) / denom
+    student_all_logps = (student_per_token_logps * loss_mask).sum(-1) / denom
+    teacher_all_logps = (teacher_per_token_logps * loss_mask).sum(-1) / denom
     
     # Clean up
     del teacher_per_token_logps

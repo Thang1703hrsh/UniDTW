@@ -3,6 +3,7 @@
 MASTER_PORT=2040
 DEVICE=${1}
 ckpt=${2}
+GPUS_PER_NODE=${2}
 
 for seed in 10 20 30 40 50
 do

@@ -55,6 +55,120 @@ from wandb_logger import init_wandb, log_metrics, finish_wandb
 
 torch.set_num_threads(4)
 
+# =========================
+# FDD helpers (same as fdd_finetune.py)
+# =========================
+
+class CustomsQwen3Attention(torch.nn.Module):
+    def __init__(self, original_self_attn):
+        super().__init__()
+        self.original = original_self_attn
+
+    def forward(self, **kwargs):
+        kwargs["output_attentions"] = False
+        return self.original(**kwargs)
+
+class CustomsOPTAttention(torch.nn.Module):
+    def __init__(self, original_self_attn):
+        super().__init__()
+        self.original = original_self_attn
+
+    def forward(self, **kwargs):
+        kwargs["output_attentions"] = False
+        return self.original(**kwargs)
+
+class CustomsGPT2Attention(torch.nn.Module):
+    def __init__(self, original_self_attn):
+        super().__init__()
+        self.original = original_self_attn
+
+    def forward(self, hidden_states, **kwargs):
+        kwargs["output_attentions"] = False
+        return self.original(hidden_states, **kwargs)
+
+def customize_model_attention(args, model, is_teacher=True):
+    """
+    Disable output_attentions for layers NOT in layer mapping (same as fdd_finetune.py)
+    """
+    # Try to use teacher_layer_mapping / student_layer_mapping
+    args_layer_mapping = args.teacher_layer_mapping if is_teacher else args.student_layer_mapping
+
+    # Prefer model type for teacher if exists
+    model_type = getattr(args, "teacher_model_type", None) if is_teacher else getattr(args, "model_type", None)
+    if model_type is None:
+        model_type = args.model_type
+
+    if model_type == "qwen":
+        for i, layer in enumerate(model.model.layers[:-1]):
+            if (i + 1) not in args_layer_mapping:
+                layer.self_attn = CustomsQwen3Attention(layer.self_attn)
+    elif model_type == "opt":
+        for i, layer in enumerate(model.model.decoder.layers[:-1]):
+            if (i + 1) not in args_layer_mapping:
+                layer.self_attn = CustomsOPTAttention(layer.self_attn)
+    elif model_type == "gpt2":
+        for i, layer in enumerate(model.transformer.h[:-1]):
+            if (i + 1) not in args_layer_mapping:
+                layer.attn = CustomsGPT2Attention(layer.attn)
+    else:
+        raise NotImplementedError(f"customize_model_attention: unsupported model_type={model_type}")
+
+def soft_label_distill_loss(student_logits, teacher_logits, mask, distill_temperature=2.0):
+    student_probs = F.log_softmax(student_logits / distill_temperature, dim=-1)
+    teacher_probs = F.softmax(teacher_logits / distill_temperature, dim=-1)
+    loss = F.kl_div(student_probs, teacher_probs, reduction="none").sum(dim=-1)
+    loss = (loss * mask).sum() / mask.sum()
+    return loss
+
+def get_fdd_loss(args, t_hiddens, s_hiddens, mask, student, teacher):
+    """
+    Same as fdd_finetune.py:
+    - traj_loss: KL on logits of selected hidden states
+    - der_loss : cosine similarity on delta log-probs (trajectory derivative)
+    """
+    i = 0
+    traj_loss, der_loss = 0.0, 0.0
+    pre_s_hidden_logs, pre_t_hidden_logs = None, None
+
+    for s_idx, t_idx in zip(args.student_layer_mapping, args.teacher_layer_mapping):
+        s_hidden = s_hiddens[s_idx]
+        t_hidden = t_hiddens[t_idx]
+
+        # OPT needs project_out alignment (same as fdd_finetune.py)
+        if args.model_type == "opt":
+            s_decoder_proj = student.module.model.model.decoder.project_out
+            if s_decoder_proj is not None:
+                s_hidden = s_decoder_proj(s_hidden)
+
+            t_decoder_proj = teacher.model.decoder.project_out
+            if t_decoder_proj is not None:
+                t_hidden = t_decoder_proj(t_hidden)
+
+        s_hidden_logits = student.module.lm_head(s_hidden)
+        t_hidden_logits = teacher.lm_head(t_hidden)
+
+        traj_loss = traj_loss + soft_label_distill_loss(s_hidden_logits, t_hidden_logits, mask)
+
+        s_hidden_logs = F.log_softmax(s_hidden_logits, dim=-1)
+        t_hidden_logs = F.log_softmax(t_hidden_logits, dim=-1)
+
+        if i > 0:
+            delta_hidden_student = s_hidden_logs - pre_s_hidden_logs
+            delta_hidden_teacher = t_hidden_logs - pre_t_hidden_logs
+            cos_sim = F.cosine_similarity(delta_hidden_student, delta_hidden_teacher, dim=-1, eps=1e-5)
+            cos_sim_loss = 1 - cos_sim
+            cos_sim_loss = (cos_sim_loss * mask).sum() / mask.sum()
+            der_loss = der_loss + cos_sim_loss
+
+        pre_s_hidden_logs, pre_t_hidden_logs = s_hidden_logs, t_hidden_logs
+        i += 1
+
+    if i == 0:
+        return torch.tensor(0.0)
+    if i == 1:
+        return traj_loss / i
+    return traj_loss / i + der_loss / (i - 1)
+
 
 def get_teacher_model(args, tokenizer, device):
     config = AutoConfig.from_pretrained(args.teacher_model_path)
@@ -67,6 +181,8 @@ def get_teacher_model(args, tokenizer, device):
             model = AutoModelForCausalLM.from_pretrained(args.teacher_model_path, config=config, device_map={"": device}, torch_dtype=torch.float32)
             model = model.half()
         
+        customize_model_attention(args, model, is_teacher=True)
+
         model.resize_token_embeddings(len(tokenizer))
         if args.peft is not None and args.teacher_peft_path is not None:
             if args.peft == "lora":
@@ -293,10 +409,23 @@ def prepare_dataset(args, tokenizer):
         
         if args.do_train:
             data["train"] = DistiLLM2Dataset(raw_datasets["train"], tokenizer, args.max_length, args.max_prompt_length)
-            # data["dev"] = DistiLLM2Dataset(raw_datasets["test"] if "test" in raw_datasets else raw_datasets["train"], tokenizer, args.max_length, args.max_prompt_length)
             print_rank("train num", len(data["train"]))
             if args.do_valid:
-                data["dev"] = LMTrainDataset(args, tokenizer, args.gt_data_dir, "valid", args.dev_num, args.dev_ratio, rng_sample)
+                # Use DistiLLM-2 dev.json if exists, else fall back to Dolly valid
+                dev_json_path = os.path.join(args.data_dir, "dev.json")
+                if os.path.exists(dev_json_path):
+                    import json as _json
+                    with open(dev_json_path) as _f:
+                        dev_raw = _json.load(_f)
+                    if args.dev_num > 0:
+                        dev_raw = dev_raw[:args.dev_num]
+                    from datasets import Dataset as HFDataset
+                    dev_hf = HFDataset.from_list(dev_raw)
+                    data["dev"] = DistiLLM2Dataset(dev_hf, tokenizer, args.max_length, args.max_prompt_length)
+                    print_rank("dev num (DistiLLM-2 dev.json)", len(data["dev"]))
+                else:
+                    data["dev"] = LMTrainDataset(args, tokenizer, args.gt_data_dir, "valid", args.dev_num, args.dev_ratio, rng_sample)
+                    print_rank("dev num (Dolly gt-data-dir)", len(data["dev"]))
         elif args.do_eval:
             data["test"] = DistiLLM2Dataset(raw_datasets["test"] if "test" in raw_datasets else raw_datasets["train"], tokenizer, args.max_length, args.max_prompt_length)
     else:
@@ -332,57 +461,20 @@ def get_distil_loss(args, no_model_batch, logits, teacher_logits):
         raise NotImplementedError
     else:
         if "distillm2" in args.type or "distillm_v2" in args.type:
-            # Get batch size to split chosen/rejected
-            batch_size = no_model_batch.get('batch_size', logits.size(0) // 2)
-            
-            # Get labels and attention mask for full concatenated batch
+            from distillm2.losses import get_distillm2_loss
             labels = no_model_batch["label"]
             attention_mask = no_model_batch.get("attention_mask", None)
-            
-            # Compute BOTH tea_pos_kl and ref_pos_kl for the concatenated batch
-            # This returns (tea_position_kl, ref_position_kl) for all examples
-            all_logps, tea_all_logps, tea_pos_kl, ref_pos_kl = get_distillm2_loss_split(
+            gradual_beta = getattr(args, 'gradual_beta', False)
+            distil_loss = get_distillm2_loss(
                 student_logits=logits,
                 teacher_logits=teacher_logits,
                 labels=labels,
                 attention_mask=attention_mask,
                 loss_type='distillm_v2',
-                logp_logq=getattr(args, 'logp_logq', None),
-                logq_logp=getattr(args, 'logq_logp', None),
                 global_step=getattr(args, 'current_global_step', None),
                 max_steps=getattr(args, 'total_iters', None),
+                gradual_beta=gradual_beta,
             )
-            
-            # Split into chosen and rejected based on concatenation
-            # For distillm_v2: chosen uses tea_pos_kl (teacher-centric), rejected uses ref_pos_kl (student-centric)
-            if "distillm_v1" in args.type:
-                # For v1: both use ref_pos_kl
-                chosen_loss = ref_pos_kl[:batch_size]
-                rejected_loss = ref_pos_kl[batch_size:]
-            else:
-                # For v2: chosen uses tea_pos_kl, rejected uses ref_pos_kl
-                chosen_loss = tea_pos_kl[:batch_size]
-                rejected_loss = ref_pos_kl[batch_size:]
-            
-            # update logp_logq and logq_logp
-            # chosen_logps, tea_chosen_logps = all_logps[:batch_size], tea_all_logps[:batch_size]
-            # rejected_logps, tea_rejected_logps = all_logps[batch_size:], tea_all_logps[batch_size:]
-            # args.logp_logq_list.append((tea_chosen_logps.exp() - chosen_logps.exp()).detach().mean().cpu())     #######
-            # args.logq_logp_list.append((rejected_logps.exp() - tea_rejected_logps.exp()).detach().mean().cpu()) #######
-            
-            # Combine with gradual beta: (2-beta)*chosen_loss + beta*rejected_loss
-            # Only use gradual beta if args.gradual_beta is True (matching original distillm-2)
-            global_step = getattr(args, 'current_global_step', None)
-            max_steps = getattr(args, 'total_iters', None)
-            gradual_beta = getattr(args, 'gradual_beta', False)
-            if gradual_beta and global_step is not None and max_steps is not None:
-                beta = 1.0 + 0.5 * min(1.0, 2 * global_step / max_steps)
-                # beta = min(max(global_step / max_steps, 0.5), 1.0) # clip into (beta_0, 1); beta_0 = 0.5
-            else:
-                # beta = 0.5
-                beta = 1.0
-            # distil_loss = ((1 - beta) * chosen_loss + beta * rejected_loss).mean() / 2
-            distil_loss = ((2 - beta) * chosen_loss + beta * rejected_loss).mean()
         elif "sfkl" in args.type:
             distil_loss = skewed_forward_kl(logits, teacher_logits, no_model_batch, lam=args.skew_alpha)
         elif "srkl" in args.type:
@@ -400,6 +492,26 @@ def get_distil_loss(args, no_model_batch, logits, teacher_logits):
         else:
             raise NotImplementedError
     return distil_loss
+
+# def get_distil_loss(args, teacher_logits, no_model_batch, logits):
+#     if args.model_parallel:
+#         raise NotImplementedError
+#     else:
+#         if "sfkl" in args.type:
+#             distil_loss = skewed_forward_kl(logits, teacher_logits, no_model_batch, lam=args.skew_alpha)
+#         elif "srkl" in args.type:
+#             distil_loss = skewed_reverse_kl(logits, teacher_logits, no_model_batch, lam=args.skew_alpha)
+#         elif "jsd" in args.type:
+#             distil_loss = js_distance(logits, teacher_logits, no_model_batch)
+#         elif "tvd" in args.type:
+#             distil_loss = tv_distance(logits, teacher_logits, no_model_batch)
+#         elif "fkl" in args.type or args.type == "kd":
+#             distil_loss = forward_kl(logits, teacher_logits, no_model_batch)
+#         elif "rkl" in args.type:
+#             distil_loss = reverse_kl(logits, teacher_logits, no_model_batch)
+#         else:
+#             raise NotImplementedError
+#     return distil_loss
 
 
 def get_teacher_lm_loss(args, tokenizer, model, teacher_model, model_batch):
@@ -600,40 +712,45 @@ def finetune(
                     
                 model.train()
 
-            outputs = model(**model_batch, use_cache=False, output_hidden_states=output_hidden_states)
-            
+            output_hidden_states = "fdd" in args.type or "dtw" in args.type
+            outputs = model(**model_batch, output_hidden_states=output_hidden_states, use_cache=False)
             logits = outputs.logits
+
             if args.model_parallel:
                 raise NotImplementedError
             else:
                 lm_loss = loss_func(logits.float().view(-1, logits.shape[-1]), no_model_batch["label"].view(-1))
-            
+
             if teacher_model is not None:
                 with torch.no_grad():
                     teacher_model.eval()
-                    teacher_outputs = teacher_model(**model_batch, use_cache=False, output_hidden_states=output_hidden_states)
+                    teacher_outputs = teacher_model(
+                        **model_batch,
+                        output_hidden_states=output_hidden_states,
+                        use_cache=False
+                    )
                     teacher_logits = teacher_outputs.logits
-                
-                # Set current global_step for DistiLLM-2
-                args.current_global_step = global_step
+
                 distil_loss = get_distil_loss(args, no_model_batch, logits, teacher_logits)
-                
+                if torch.isnan(distil_loss) or torch.isinf(distil_loss):
+                    distil_loss = torch.tensor(0.0, device=logits.device)
+
                 if "fdd" in args.type:
                     fdd_loss = get_fdd_loss(
-                        teacher_outputs.hidden_states, outputs.hidden_states, 
-                        model_batch['attention_mask'], 
-                        teacher_model, model, 
-                        teacher_schedule, student_schedule
+                        args,
+                        teacher_outputs.hidden_states,
+                        outputs.hidden_states,
+                        model_batch["attention_mask"],
+                        model,
+                        teacher_model
                     )
                 else:
                     fdd_loss = torch.tensor(0.0).to(distil_loss.device)
-                
+
                 loss = (1 - args.kd_ratio) * lm_loss + args.kd_ratio * (distil_loss + fdd_loss)
             else:
                 loss = lm_loss
-                distil_loss = torch.tensor(0.0).to(loss.device)
-                fdd_loss = torch.tensor(0.0).to(loss.device)
-            
+
             if "contra" in args.type:
                 hidden_states = outputs.hidden_states
                 mask = (no_model_batch["label"] != -100).float()
@@ -655,7 +772,7 @@ def finetune(
 
             if "dtw" in args.type:
                 hidden_states = outputs.hidden_states
-                mask = (no_model_batch["label"] != -100).float()
+                mask = model_batch["attention_mask"].float()
 
                 if args.dtw_gamma_steps and args.dtw_gamma_steps > 0:
                     gamma_start = args.dtw_gamma_start if args.dtw_gamma_start is not None else args.dtw_gamma
@@ -697,6 +814,8 @@ def finetune(
                     unit_ids=unit_ids,
                     importance_weights=importance_weights,
                 )
+                if torch.isnan(dtw_loss) or torch.isinf(dtw_loss):
+                    dtw_loss = torch.tensor(0.0, device=loss.device)
                 loss += args.dtw_weight * dtw_loss
             else:
                 dtw_loss = torch.tensor(0.0).to(loss.device)
@@ -842,7 +961,8 @@ def finetune(
             torch.cuda.empty_cache()
 
             if step % args.gradient_accumulation_steps == 0:
-                global_step += 1       
+                global_step += 1
+                args.current_global_step = global_step
             step += 1
             
             if global_step > args.total_iters:

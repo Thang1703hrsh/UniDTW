@@ -5,7 +5,7 @@ MASTER_ADDR=localhost
 MASTER_PORT=2012
 NNODES=1
 NODE_RANK=0
-GPUS_PER_NODE=2  # Set mặc định là 2 (cho 2 GPU A100 của bạn)
+GPUS_PER_NODE=1  # Set mặc định là 2 (cho 2 GPU A100 của bạn)
 
 DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE \
                   --nnodes $NNODES \
@@ -19,13 +19,13 @@ DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE \
 # Lấy thư mục hiện tại làm gốc
 BASE_PATH=${1:-$(pwd)}
 
-# --- STUDENT & TEACHER (Sử dụng HF ID để ổn định) ---
+# --- STUDENT (GPT-2 120M) ---
+CKPT_NAME="llama2-7B-dolly-lora"
+CKPT="${BASE_PATH}/llama2-7B-init-dolly-lora"
 
-CKPT_NAME="gpt2-120M-dolly"
-CKPT="bachthetrollface/gpt2-120M-init-dolly"
-
-TEACHER_CKPT_NAME="gpt2-1.5B-dolly"
-TEACHER_CKPT="bachthetrollface/gpt2-1.5B-teacher-dolly"
+# --- TEACHER (GPT-2 1.5B) ---
+TEACHER_CKPT_NAME="llama2-13B-dolly-lora"
+TEACHER_CKPT="${BASE_PATH}/llama2-13B-teacher-dolly-lora"
 
 # --- PROJECTOR (từ bước train trước) ---
 VF_SAVE_DIR="${BASE_PATH}/results/gpt2/train/velocity_field"
@@ -40,7 +40,7 @@ LM_DATA_DIR="${BASE_PATH}/processed_data/openwebtext/gpt2/512/22.87K/"
 # =========================================================
 # 3. HYPERPARAMETERS
 # =========================================================
-BATCH_SIZE=16       # An toàn cho 2 GPU
+BATCH_SIZE=1       # An toàn cho 2 GPU
 LR=0.0005
 GRAD_ACC=1         # Tăng tích lũy gradient để bù cho batch size nhỏ
 EVAL_BATCH_SIZE=64
@@ -61,7 +61,7 @@ OPTS+=" --teacher-ckpt-name ${TEACHER_CKPT_NAME}"
 OPTS+=" --teacher-model-fp16"
 OPTS+=" --n-gpu ${GPUS_PER_NODE}"
 
-# OPTS+=" --gradient-checkpointing"
+OPTS+=" --gradient-checkpointing"
 
 # Data Config
 OPTS+=" --data-dir ${DATA_DIR}"

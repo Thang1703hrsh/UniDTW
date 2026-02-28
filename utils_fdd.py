@@ -117,7 +117,7 @@ def initialize(args):
 
 
 # Load and save model
-def get_model(args, tokenizer, device):
+def get_model(args, device):
     config = AutoConfig.from_pretrained(args.model_path)
     
     st_time = time.time()
@@ -126,13 +126,14 @@ def get_model(args, tokenizer, device):
     else:
         config.is_model_parallel = False
         dtype = torch.float32 if args.fp32 else torch.float16
+        if args.bf16:
+            dtype = torch.bfloat16
         try:
             model = AutoModelForCausalLM.from_pretrained(args.model_path, config=config, device_map={"": device}, torch_dtype=dtype)
         except:
             model = AutoModelForCausalLM.from_pretrained(args.model_path, config=config, device_map={"": device}, torch_dtype=torch.float32)
             model = model.half()
         
-        model.resize_token_embeddings(len(tokenizer))
         if args.peft is not None:
             if args.peft == "lora":
                 model.enable_input_require_grads()
@@ -178,11 +179,13 @@ def get_optimizer_params(args, model: nn.Module):
     # taken from https://github.com/facebookresearch/SpanBERT/blob/0670d8b6a38f6714b85ea7a033f16bd8cc162676/code/run_tacred.py
     param_optimizer = list(model.named_parameters())
     no_decay = ['bias', 'ln_f.weight', 'ln_1.weight', 'ln_2.weight', 'ln_cross_attn']
+    projector_param = ['projectors', 'projector']
+
     optimizer_grouped_parameters = [
         {'params': [p for n, p in param_optimizer
-                    if not any(nd in n for nd in no_decay)]},
+                    if not any(nd in n for nd in no_decay) and not any(nd in n for nd in projector_param)]},
         {'params': [p for n, p in param_optimizer
-                    if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
+                    if any(nd in n for nd in no_decay) and not any(nd in n for nd in projector_param)], 'weight_decay': 0.0},
     ]
 
     return optimizer_grouped_parameters
@@ -191,51 +194,23 @@ def get_optimizer_params(args, model: nn.Module):
 def get_optimizer_params_peft(args, model: nn.Module):
     # taken from https://github.com/facebookresearch/SpanBERT/blob/0670d8b6a38f6714b85ea7a033f16bd8cc162676/code/run_tacred.py
     param_optimizer = list(model.named_parameters())
+    projector_param = ['projectors', 'projector']
     optimizer_grouped_parameters = [
-        {'params': [p for n, p in param_optimizer if p.requires_grad]},
+        {'params': [p for n, p in param_optimizer if p.requires_grad and not any(nd in n for nd in projector_param)]},
     ]
 
     return optimizer_grouped_parameters
 
 
 def get_tokenizer(args):
-    # Try to load tokenizer with multiple fallback strategies
-    tokenizer = None
-    errors = []
-
-    # Strategy 1: Try loading from model_path
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(args.model_path)
-    except Exception as e:
-        errors.append(f"Strategy 1 (model_path) failed: {e}")
-
-        # Strategy 2: Try with use_fast=False
-        try:
-            tokenizer = AutoTokenizer.from_pretrained(args.model_path, use_fast=False)
-            print(f"Warning: Using slow tokenizer for {args.model_path}")
-        except Exception as e2:
-            errors.append(f"Strategy 2 (slow tokenizer) failed: {e2}")
-
-            # Strategy 3: For GPT-2 models, use base gpt2 tokenizer
-            if args.model_type == "gpt2":
-                try:
-                    print(f"Warning: Using base gpt2 tokenizer instead of {args.model_path}")
-                    tokenizer = AutoTokenizer.from_pretrained("gpt2")
-                except Exception as e3:
-                    errors.append(f"Strategy 3 (base gpt2) failed: {e3}")
-                    raise RuntimeError(f"All tokenizer loading strategies failed:\n" + "\n".join(errors))
-            else:
-                raise RuntimeError(f"All tokenizer loading strategies failed:\n" + "\n".join(errors))
-
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     if args.model_type in ["gpt2", "opt", "llama", "gptj", "llama2", "mistral"]:
         tokenizer.pad_token_id = tokenizer.eos_token_id
-        tokenizer.padding_side = 'left'  # Set left padding for decoder-only models
     elif args.model_type=="qwen":
         tokenizer.pad_token_id = 151646
         tokenizer.eos_token_id = 151643
         tokenizer.pad_token_id = tokenizer.eos_token_id
-        tokenizer.padding_side = 'left'  # Set left padding for decoder-only models
-
+    
     return tokenizer
 
 
@@ -255,22 +230,3 @@ def save_parallel(model, save_dir):
     checkpoint_name = os.path.join(save_dir, f"mp{mpu.get_model_parallel_world_size()}", f"pytorch_model_{mp_rank}.bin")
     torch.save(model.state_dict(), checkpoint_name)
     print(f"Rank {get_rank()}: {checkpoint_name} saved.")
-
-
-def get_distillation_schedule(num_teacher_layers: int, num_student_layers: int, num_distill_layers: int):
-    """Create a uniform mapping of layers between teacher and student."""
-    teacher_layers = np.linspace(
-        0, 
-        num_teacher_layers, 
-        num_distill_layers+2, 
-        endpoint=True, 
-        dtype=int
-    )
-    student_layers = np.linspace(
-        0, 
-        num_student_layers, 
-        num_distill_layers+2, 
-        endpoint=True, 
-        dtype=int
-    )
-    return teacher_layers[1:-1], student_layers[1:-1]
